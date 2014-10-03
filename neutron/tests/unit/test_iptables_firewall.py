@@ -23,6 +23,7 @@ from oslo.config import cfg
 
 from neutron.agent.common import config as a_cfg
 from neutron.agent.linux.iptables_firewall import IptablesFirewallDriver
+from neutron.common import constants
 from neutron.tests import base
 from neutron.tests.unit import test_api_v2
 
@@ -42,6 +43,23 @@ class IptablesFirewallTestCase(base.BaseTestCase):
             'neutron.agent.linux.utils.execute')
         self.utils_exec = self.utils_exec_p.start()
         self.addCleanup(self.utils_exec_p.stop)
+
+        def fake_execute(*args, **kwargs):
+            if args[0][0] == "ebtables" and args[0][2] == "filter":
+                return ('Bridge table: filter\n'
+                        '\n'
+                        'Bridge chain: INPUT, entries: 1, policy: ACCEPT\n'
+                        '-j CONTINUE , pcnt = 0 -- bcnt = 0\n'
+                        '\n'
+                        'Bridge chain: FORWARD, entries: 1, policy: ACCEPT\n'
+                        '-j CONTINUE , pcnt = 0 -- bcnt = 1\n'
+                        '\n'
+                        'Bridge chain: OUTPUT, entries: 1, policy: ACCEPT\n'
+                        '-j CONTINUE , pcnt = 1 -- bcnt = 1')
+            return ''
+
+        self.utils_exec.side_effect = fake_execute
+
         self.iptables_cls_p = mock.patch(
             'neutron.agent.linux.iptables_manager.IptablesManager')
         iptables_cls = self.iptables_cls_p.start()
@@ -57,7 +75,8 @@ class IptablesFirewallTestCase(base.BaseTestCase):
         self.firewall.iptables = self.iptables_inst
 
     def _fake_port(self):
-        return {'device': 'tapfake_dev',
+        return {'id': '12345678-1234-aaaa-1234567890ab',
+                'device': 'tapfake_dev',
                 'mac_address': 'ff:ff:ff:ff',
                 'fixed_ips': [FAKE_IP['IPv4'],
                               FAKE_IP['IPv6']]}
@@ -80,7 +99,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                                '-j $ifake_dev'),
                  call.add_rule(
                      'ifake_dev', '-m state --state INVALID -j DROP'),
-                 call.add_rule('ifake_dev', '-j $sfake_dev'),
                  call.add_rule(
                      'ifake_dev',
                      '-m state --state RELATED,ESTABLISHED -j RETURN'),
@@ -98,16 +116,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                                '-m physdev --physdev-in tapfake_dev '
                                '--physdev-is-bridged '
                                '-j $ofake_dev'),
-                 call.add_chain('sfake_dev'),
-                 call.add_rule(
-                     'sfake_dev', '-m mac --mac-source ff:ff:ff:ff '
-                     '-s 10.0.0.1 -j RETURN'),
-                 call.add_rule('sfake_dev', '-d 10.0.0.1 -j RETURN'),
-                 call.add_rule('sfake_dev', '-j DROP'),
-                 call.add_rule(
-                     'ofake_dev',
-                     '-p udp -m udp --sport 68 --dport 67 -j RETURN'),
-                 call.add_rule('ofake_dev', '-j $sfake_dev'),
                  call.add_rule(
                      'ofake_dev',
                      '-p udp -m udp --sport 67 --dport 68 -j DROP'),
@@ -723,15 +731,9 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                                   egress_expected_call=None):
         port = self._fake_port()
         ethertype = rule['ethertype']
-        prefix = FAKE_IP[ethertype]
         filter_inst = self.v4filter_inst
-        dhcp_rule = call.add_rule(
-            'ofake_dev',
-            '-p udp -m udp --sport 68 --dport 67 -j RETURN')
-
         if ethertype == 'IPv6':
             filter_inst = self.v6filter_inst
-            dhcp_rule = call.add_rule('ofake_dev', '-p icmpv6 -j RETURN')
 
         sg = [rule]
         port['security_group_rules'] = sg
@@ -756,21 +758,11 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                     call.add_rule('ifake_dev',
                                   '-p icmpv6 --icmpv6-type %s -j RETURN' %
                                   icmp6_type))
-
-        if ethertype == 'IPv4':
-            calls += [call.add_rule('ifake_dev',
-                                    '-m state --state INVALID -j DROP'),
-                      call.add_rule('ifake_dev',
-                                    '-j $sfake_dev'),
-                      call.add_rule('ifake_dev',
-                                    '-m state --state RELATED,ESTABLISHED '
-                                    '-j RETURN')]
-        else:
-            calls += [call.add_rule('ifake_dev',
-                                    '-m state --state INVALID -j DROP'),
-                      call.add_rule('ifake_dev',
-                                    '-m state --state RELATED,ESTABLISHED '
-                                    '-j RETURN')]
+        calls += [call.add_rule('ifake_dev',
+                                '-m state --state INVALID -j DROP'),
+                  call.add_rule(
+                      'ifake_dev',
+                      '-m state --state RELATED,ESTABLISHED -j RETURN')]
 
         if ingress_expected_call:
             calls.append(ingress_expected_call)
@@ -788,18 +780,7 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                   call.add_rule('INPUT',
                                 '-m physdev --physdev-in tapfake_dev '
                                 '--physdev-is-bridged '
-                                '-j $ofake_dev'),
-                  call.add_chain('sfake_dev'),
-                  call.add_rule(
-                      'sfake_dev',
-                      '-m mac --mac-source ff:ff:ff:ff -s %s -j RETURN'
-                      % prefix),
-                  call.add_rule(
-                      'sfake_dev',
-                      '-d %s -j RETURN' % prefix),
-                  call.add_rule('sfake_dev', '-j DROP'),
-                  dhcp_rule,
-                  call.add_rule('ofake_dev', '-j $sfake_dev')]
+                                '-j $ofake_dev')]
         if ethertype == 'IPv4':
             calls.append(call.add_rule(
                 'ofake_dev',
@@ -808,8 +789,8 @@ class IptablesFirewallTestCase(base.BaseTestCase):
         calls += [call.add_rule(
                   'ofake_dev', '-m state --state INVALID -j DROP'),
                   call.add_rule(
-                  'ofake_dev',
-                  '-m state --state RELATED,ESTABLISHED -j RETURN')]
+                      'ofake_dev',
+                      '-m state --state RELATED,ESTABLISHED -j RETURN')]
 
         if egress_expected_call:
             calls.append(egress_expected_call)
@@ -846,8 +827,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                  call.add_rule(
                      'ifake_dev', '-m state --state INVALID -j DROP'),
                  call.add_rule(
-                     'ifake_dev', '-j $sfake_dev'),
-                 call.add_rule(
                      'ifake_dev',
                      '-m state --state RELATED,ESTABLISHED -j RETURN'),
                  call.add_rule('ifake_dev', '-j RETURN'),
@@ -865,19 +844,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                      'INPUT',
                      '-m physdev --physdev-in tapfake_dev '
                      '--physdev-is-bridged -j $ofake_dev'),
-                 call.add_chain('sfake_dev'),
-                 call.add_rule(
-                     'sfake_dev',
-                     '-m mac --mac-source ff:ff:ff:ff -s 10.0.0.1 '
-                     '-j RETURN'),
-                 call.add_rule(
-                     'sfake_dev',
-                     '-d 10.0.0.1 -j RETURN'),
-                 call.add_rule('sfake_dev', '-j DROP'),
-                 call.add_rule(
-                     'ofake_dev',
-                     '-p udp -m udp --sport 68 --dport 67 -j RETURN'),
-                 call.add_rule('ofake_dev', '-j $sfake_dev'),
                  call.add_rule(
                      'ofake_dev',
                      '-p udp -m udp --sport 67 --dport 68 -j DROP'),
@@ -890,7 +856,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                  call.add_rule('sg-chain', '-j ACCEPT'),
                  call.ensure_remove_chain('ifake_dev'),
                  call.ensure_remove_chain('ofake_dev'),
-                 call.ensure_remove_chain('sfake_dev'),
                  call.ensure_remove_chain('sg-chain'),
                  call.add_chain('sg-chain'),
                  call.add_chain('ifake_dev'),
@@ -905,7 +870,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                  call.add_rule(
                      'ifake_dev',
                      '-m state --state INVALID -j DROP'),
-                 call.add_rule('ifake_dev', '-j $sfake_dev'),
                  call.add_rule(
                      'ifake_dev',
                      '-m state --state RELATED,ESTABLISHED -j RETURN'),
@@ -923,19 +887,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                      'INPUT',
                      '-m physdev --physdev-in tapfake_dev '
                      '--physdev-is-bridged -j $ofake_dev'),
-                 call.add_chain('sfake_dev'),
-                 call.add_rule(
-                     'sfake_dev',
-                     '-m mac --mac-source ff:ff:ff:ff:ff:ff -s 10.0.0.1 '
-                     '-j RETURN'),
-                 call.add_rule(
-                     'sfake_dev',
-                     '-d %s -j RETURN' % prefix),
-                 call.add_rule('sfake_dev', '-j DROP'),
-                 call.add_rule(
-                     'ofake_dev',
-                     '-p udp -m udp --sport 68 --dport 67 -j RETURN'),
-                 call.add_rule('ofake_dev', '-j $sfake_dev'),
                  call.add_rule(
                      'ofake_dev',
                      '-p udp -m udp --sport 67 --dport 68 -j DROP'),
@@ -949,7 +900,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                  call.add_rule('sg-chain', '-j ACCEPT'),
                  call.ensure_remove_chain('ifake_dev'),
                  call.ensure_remove_chain('ofake_dev'),
-                 call.ensure_remove_chain('sfake_dev'),
                  call.ensure_remove_chain('sg-chain'),
                  call.add_chain('sg-chain')]
 
@@ -1041,7 +991,8 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                                         call.setup(device2port)])
 
     def test_ip_spoofing_filter_with_multiple_ips(self):
-        port = {'device': 'tapfake_dev',
+        port = {'id': '12345678-1234-aaaa-1234567890ab',
+                'device': 'tapfake_dev',
                 'mac_address': 'ff:ff:ff:ff',
                 'fixed_ips': ['10.0.0.1', 'fe80::1', '10.0.0.2']}
         self.firewall.prepare_port_filter(port)
@@ -1060,7 +1011,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                                '-j $ifake_dev'),
                  call.add_rule(
                      'ifake_dev', '-m state --state INVALID -j DROP'),
-                 call.add_rule('ifake_dev', '-j $sfake_dev'),
                  call.add_rule(
                      'ifake_dev',
                      '-m state --state RELATED,ESTABLISHED -j RETURN'),
@@ -1078,24 +1028,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                                '-m physdev --physdev-in tapfake_dev '
                                '--physdev-is-bridged '
                                '-j $ofake_dev'),
-                 call.add_chain('sfake_dev'),
-                 call.add_rule(
-                     'sfake_dev',
-                     '-m mac --mac-source ff:ff:ff:ff:ff:ff -s 10.0.0.1 '
-                     '-j RETURN'),
-                 call.add_rule('sfake_dev', '-d 10.0.0.1 -j RETURN'),
-                 call.add_rule(
-                     'sfake_dev',
-                     '-m mac --mac-source ff:ff:ff:ff:ff:ff -s 10.0.0.2 '
-                     '-j RETURN'),
-                 call.add_rule(
-                     'sfake_dev',
-                     '-d 10.0.0.2 -j RETURN'),
-                 call.add_rule('sfake_dev', '-j DROP'),
-                 call.add_rule(
-                     'ofake_dev',
-                     '-p udp -m udp --sport 68 --dport 67 -j RETURN'),
-                 call.add_rule('ofake_dev', '-j $sfake_dev'),
                  call.add_rule(
                      'ofake_dev',
                      '-p udp -m udp --sport 67 --dport 68 -j DROP'),
@@ -1109,7 +1041,8 @@ class IptablesFirewallTestCase(base.BaseTestCase):
         self.v4filter_inst.assert_has_calls(calls)
 
     def test_ip_spoofing_no_fixed_ips(self):
-        port = {'device': 'tapfake_dev',
+        port = {'id': '12345678-1234-aaaa-1234567890ab',
+                'device': 'tapfake_dev',
                 'mac_address': 'ff:ff:ff:ff',
                 'fixed_ips': []}
         self.firewall.prepare_port_filter(port)
@@ -1128,7 +1061,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                                '-j $ifake_dev'),
                  call.add_rule(
                      'ifake_dev', '-m state --state INVALID -j DROP'),
-                 call.add_rule('ifake_dev', '-j $sfake_dev'),
                  call.add_rule(
                      'ifake_dev',
                      '-m state --state RELATED,ESTABLISHED -j RETURN'),
@@ -1146,15 +1078,6 @@ class IptablesFirewallTestCase(base.BaseTestCase):
                                '-m physdev --physdev-in tapfake_dev '
                                '--physdev-is-bridged '
                                '-j $ofake_dev'),
-                 call.add_chain('sfake_dev'),
-                 call.add_rule(
-                     'sfake_dev',
-                     '-m mac --mac-source ff:ff:ff:ff -j RETURN'),
-                 call.add_rule('sfake_dev', '-j DROP'),
-                 call.add_rule(
-                     'ofake_dev',
-                     '-p udp -m udp --sport 68 --dport 67 -j RETURN'),
-                 call.add_rule('ofake_dev', '-j $sfake_dev'),
                  call.add_rule(
                      'ofake_dev',
                      '-p udp -m udp --sport 67 --dport 68 -j DROP'),

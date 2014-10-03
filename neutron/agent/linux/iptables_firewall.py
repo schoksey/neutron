@@ -18,7 +18,11 @@
 import netaddr
 from oslo.config import cfg
 
+from neutronclient.common import exceptions
+from neutronclient.v2_0 import client
+
 from neutron.agent import firewall
+from neutron.agent.linux import ebtables_manager
 from neutron.agent.linux import iptables_manager
 from neutron.common import constants
 from neutron.openstack.common import log as logging
@@ -28,11 +32,188 @@ LOG = logging.getLogger(__name__)
 SG_CHAIN = 'sg-chain'
 INGRESS_DIRECTION = 'ingress'
 EGRESS_DIRECTION = 'egress'
-SPOOF_FILTER = 'spoof-filter'
 CHAIN_NAME_PREFIX = {INGRESS_DIRECTION: 'i',
-                     EGRESS_DIRECTION: 'o',
-                     SPOOF_FILTER: 's'}
+                     EGRESS_DIRECTION: 'o'}
+SPOOFING_CHAIN_NAME_PREFIX_ARP = '-arp-'
+SPOOFING_CHAIN_NAME_PREFIX_IP = '-ip-'
 LINUX_DEV_LEN = 14
+
+anti_spoof_opts = [
+    cfg.BoolOpt('disable_anti_spoofing',
+                default=False,
+                help=_('Disable anti-spoofing for Neutron services ports')),
+    cfg.StrOpt('sec_group_svc_VM_name',
+               help=_("Security group service VM name")),
+]
+
+CONF = cfg.CONF
+CONF.register_opts(anti_spoof_opts)
+
+
+class NWFilterFirewall(object):
+    """
+    This class implements a network filtering mechanism by using
+    ebtables.
+
+    All port get a base filter applied. This filter provides some basic
+    security such as protection against MAC spoofing, IP spoofing, and ARP
+    spoofing.
+    """
+
+    def __init__(self):
+        self.ebtables = ebtables_manager.EbtablesManager(
+            root_helper=cfg.CONF.AGENT.root_helper,
+            prefix_chain='neutron-nwfilter')
+        with ebtables_manager.EbtablesManagerTransaction(self.ebtables):
+            del self.ebtables.tables['nat']
+            del self.ebtables.tables['broute']
+            table = self.ebtables.tables['filter']
+            self.fallback_chain_name = self._add_fallback_chain(table)
+
+    def setup_basic_filtering(self, port_id, device, mac_ip_pairs):
+        if port_id is None or device is None:
+            return
+        if mac_ip_pairs is None or mac_ip_pairs[0] is None:
+            return
+
+        table = self.ebtables.tables['filter']
+
+        # Set rules and chains for the device
+        self._setup_device_chains(table, port_id, device)
+
+        # Set anti ARP spoofing
+        arp_rules = self._setup_arp_antispoofing(mac_ip_pairs)
+        arp_rules += ['-j $%s' % self.fallback_chain_name]
+        arp_chain_name = self._port_chain_name(SPOOFING_CHAIN_NAME_PREFIX_ARP
+                                               + port_id, INGRESS_DIRECTION)
+        self._set_chain_and_rules(table, arp_chain_name, arp_rules)
+        rules = ['-p arp -j $%s' % arp_chain_name]
+        self._set_rules_for_device(table, port_id, rules,
+                                   INGRESS_DIRECTION)
+
+        # Set the MAC/IP anti spoofing rules and allow DHCP traffic
+        # NOTE(ethuleau): more?
+        # - IPv6 neighbor discovery reflection filter
+        # - IPv6 RA advertisement filter
+        # - ...
+        # Should we implement _accept_inbound_icmpv6 (line 374) method here?
+        ip_rules = self._allow_dhcp_request()
+        ip_rules += self._drop_dhcp_offer_rule()
+        ip_rules += self._setup_mac_ip_antispoofing(mac_ip_pairs)
+        ip_rules += ['-j $%s' % self.fallback_chain_name]
+        ip_chain_name = self._port_chain_name(SPOOFING_CHAIN_NAME_PREFIX_IP
+                                              + port_id, INGRESS_DIRECTION)
+        self._set_chain_and_rules(table, ip_chain_name, ip_rules)
+        jump_rules = ['-p IPv4 -j $%s' % ip_chain_name]
+        jump_rules += ['-p IPv6 -j $%s' % ip_chain_name]
+        self._set_rules_for_device(table, port_id, jump_rules,
+                                   INGRESS_DIRECTION)
+
+        self.ebtables.apply()
+
+    def unfilter_instance(self, port_id):
+        if port_id is None:
+            return
+
+        table = self.ebtables.tables['filter']
+
+        chain_name = self._port_chain_name(port_id, INGRESS_DIRECTION)
+        table.ensure_remove_chain(chain_name)
+
+        arp_chain_name = self._port_chain_name(SPOOFING_CHAIN_NAME_PREFIX_ARP +
+                                               port_id,
+                                               INGRESS_DIRECTION)
+        table.ensure_remove_chain(arp_chain_name)
+
+        ip_chain_name = self._port_chain_name(SPOOFING_CHAIN_NAME_PREFIX_IP +
+                                              port_id,
+                                              INGRESS_DIRECTION)
+        table.ensure_remove_chain(ip_chain_name)
+
+        self.ebtables.apply()
+
+    def defer_apply_on(self):
+        self.ebtables.defer_apply_on()
+
+    def defer_apply_off(self):
+        self.ebtables.defer_apply_off()
+
+    def _setup_device_chains(self, table, port_id, device):
+        # Add chain and jump to all incoming from the device
+        chain_name = self._port_chain_name(port_id, INGRESS_DIRECTION)
+        table.add_chain(chain_name)
+        rule = '--in-interface %s -j $%s' % (device, chain_name)
+        table.add_rule('FORWARD', rule, top=True)
+
+        # NOTE(ethuleau): Do we need to apply some filters on traffic going to
+        # the device (eg. DHCP request of neighbors)?
+
+    def _allow_dhcp_request(self):
+        # Note(ethuleau): The sg mixin already set default provider sg to
+        # protect DHCP traffic (neutron/db/securitygroups_rpc_base.py, line
+        # 254).
+        # Only incoming DHCP server traffic is authorize from DHCP
+        # servers IP and DHCP server traffic is drop if it's coming from the
+        # VM. Should we support that in the NWFilterFirewall class?
+        rules = []
+        for proto in ['udp', 'tcp']:
+            # NOTE(ethuleau): we limit DHCP request to not overload DHCP agents
+            # One request per second with a burst of 5 (default value) is
+            # enough?
+            rules += ['-p IPv4 --ip-proto %s --ip-sport 68 --ip-dport 67 '
+                      '--limit 1/s -j ACCEPT' % proto]
+        return rules
+
+    def _drop_dhcp_offer_rule(self):
+        rules = []
+        for proto in ['udp', 'tcp']:
+            rules += ['-p IPv4 --ip-proto %s --ip-sport 67 --ip-dport 68 '
+                      '-j DROP' % proto]
+        return rules
+
+    def _setup_mac_ip_antispoofing(self, mac_ip_pairs):
+        rules = []
+        for mac, ip in mac_ip_pairs:
+            if ip is None:
+                rules += ['-p %s -j RETURN' % mac]
+            else:
+                rules += ['-s %s -p %s --ip-source %s -j RETURN' %
+                          (mac, self._get_ip_protocol(ip), ip)]
+        return rules
+
+    def _setup_arp_antispoofing(self, mac_ip_pairs):
+        rules = []
+        for mac, ip in mac_ip_pairs:
+            if ip is not None:
+                rules += [('-p arp --arp-opcode 2 --arp-mac-src %s '
+                           '--arp-ip-src %s -j RETURN') % (mac, ip)]
+        rules += ['-p ARP --arp-op Request -j ACCEPT']
+        return rules
+
+    def _add_fallback_chain(self, table):
+        table.add_chain('spoofing-fallback')
+        table.add_rule('spoofing-fallback', '-j DROP')
+        return self.ebtables.get_chain_name('spoofing-fallback')
+
+    def _port_chain_name(self, port_id, direction):
+        return self.ebtables.get_chain_name(
+            '%s%s' % (CHAIN_NAME_PREFIX[direction], port_id))
+
+    def _get_ip_protocol(self, ip_address):
+        if netaddr.IPNetwork(ip_address).version == 4:
+            return 'IPv4'
+        else:
+            return 'IPv6'
+
+    def _set_rules_for_device(self, table, port_id, rules, DIRECTION):
+        chain_name = self._port_chain_name(port_id, DIRECTION)
+        for rule in rules:
+            table.add_rule(chain_name, rule)
+
+    def _set_chain_and_rules(self, table, chain_name, rules):
+        table.add_chain(chain_name)
+        for rule in rules:
+            table.add_rule(chain_name, rule)
 
 
 class IptablesFirewallDriver(firewall.FirewallDriver):
@@ -49,6 +230,7 @@ class IptablesFirewallDriver(firewall.FirewallDriver):
         self._add_fallback_chain_v4v6()
         self._defer_apply = False
         self._pre_defer_filtered_ports = None
+        self.nwfilter = NWFilterFirewall()
 
     @property
     def ports(self):
@@ -101,12 +283,12 @@ class IptablesFirewallDriver(firewall.FirewallDriver):
         """Remove ingress and egress chain for a port."""
         if not self._defer_apply:
             self._remove_chains_apply(self.filtered_ports)
-
+        
     def _remove_chains_apply(self, ports):
         for port in ports.values():
             self._remove_chain(port, INGRESS_DIRECTION)
             self._remove_chain(port, EGRESS_DIRECTION)
-            self._remove_chain(port, SPOOF_FILTER)
+            self.nwfilter.unfilter_instance(port['id'])
         self._remove_chain_by_name_v4v6(SG_CHAIN)
 
     def _setup_chain(self, port, DIRECTION):
@@ -185,67 +367,36 @@ class IptablesFirewallDriver(firewall.FirewallDriver):
                 for rule in port.get('security_group_rules', [])
                 if rule['direction'] == direction]
 
-    def _arp_spoofing_rule(self, port):
-        return '-m mac ! --mac-source %s -j DROP' % port['mac_address']
-
-    def _setup_spoof_filter_chain(self, port, table, mac_ip_pairs, rules):
-        if mac_ip_pairs:
-            chain_name = self._port_chain_name(port, SPOOF_FILTER)
-            table.add_chain(chain_name)
-            for mac, ip in mac_ip_pairs:
-                if ip is None:
-                    # If fixed_ips is [] this rule will be added to the end
-                    # of the list after the allowed_address_pair rules.
-                    table.add_rule(chain_name,
-                                   '-m mac --mac-source %s -j RETURN'
-                                   % mac)
-                else:
-                    table.add_rule(chain_name,
-                                   '-m mac --mac-source %s -s %s -j RETURN'
-                                   % (mac, ip))
-
-                    table.add_rule(chain_name,
-                                   '-d %s -j RETURN' % ip)
-
-            table.add_rule(chain_name, '-j DROP')
-            rules.append('-j $%s' % chain_name)
-
-    def _build_ipv4v6_mac_ip_list(self, mac, ip_address, mac_ipv4_pairs,
-                                  mac_ipv6_pairs):
-        if netaddr.IPNetwork(ip_address).version == 4:
-            mac_ipv4_pairs.append((mac, ip_address))
-        else:
-            mac_ipv6_pairs.append((mac, ip_address))
-
-    def _spoofing_rule(self, port, ipv4_rules, ipv6_rules):
-        #Note(nati) allow dhcp or RA packet
-        ipv4_rules += ['-p udp -m udp --sport 68 --dport 67 -j RETURN']
-        ipv6_rules += ['-p icmpv6 -j RETURN']
-        mac_ipv4_pairs = []
-        mac_ipv6_pairs = []
+    def _get_mac_ip_pair(self, port):
+        # Note(ethuleau): Why? Insted, we should drop RA from a VM port.
+        #ipv6_rules += ['-p icmpv6 -j RETURN']
+        mac_ip_pairs = []
 
         if isinstance(port.get('allowed_address_pairs'), list):
             for address_pair in port['allowed_address_pairs']:
-                self._build_ipv4v6_mac_ip_list(address_pair['mac_address'],
-                                               address_pair['ip_address'],
-                                               mac_ipv4_pairs,
-                                               mac_ipv6_pairs)
+                mac_ip_pairs.append((address_pair['mac_address'],
+                                     address_pair['ip_address']))
 
         for ip in port['fixed_ips']:
-            self._build_ipv4v6_mac_ip_list(port['mac_address'], ip,
-                                           mac_ipv4_pairs, mac_ipv6_pairs)
-        if not port['fixed_ips']:
-            mac_ipv4_pairs.append((port['mac_address'], None))
-            mac_ipv6_pairs.append((port['mac_address'], None))
+            mac_ip_pairs.append((port['mac_address'], ip))
 
-        self._setup_spoof_filter_chain(port, self.iptables.ipv4['filter'],
-                                       mac_ipv4_pairs, ipv4_rules)
-        self._setup_spoof_filter_chain(port, self.iptables.ipv6['filter'],
-                                       mac_ipv6_pairs, ipv6_rules)
+        if not port['fixed_ips']:
+            mac_ip_pairs.append((port['mac_address'], None))
+
+        return mac_ip_pairs
 
     def _drop_dhcp_rule(self):
         #Note(nati) Drop dhcp packet from VM
         return ['-p udp -m udp --sport 67 --dport 68 -j DROP']
+
+    def _accept_inbound_icmpv6(self):
+        # Allow router advertisements, multicast listener
+        # and neighbor advertisement into the instance
+        icmpv6_rules = []
+        for icmp6_type in constants.ICMPV6_ALLOWED_TYPES:
+            icmpv6_rules += ['-p icmpv6 --icmpv6-type %s -j RETURN' %
+                             icmp6_type]
+        return icmpv6_rules
 
     def _add_rule_by_security_group(self, port, direction):
         chain_name = self._port_chain_name(port, direction)
@@ -259,24 +410,65 @@ class IptablesFirewallDriver(firewall.FirewallDriver):
         ipv4_iptables_rule = []
         ipv6_iptables_rule = []
         if direction == EGRESS_DIRECTION:
-            self._spoofing_rule(port,
-                                ipv4_iptables_rule,
-                                ipv6_iptables_rule)
-            ipv4_iptables_rule += self._drop_dhcp_rule()
+            sg_match = False
+            secgrid = ""
+            if(CONF.disable_anti_spoofing):
+                # Disable anti-spoofing for specified security group
+
+                # neutronClient credentials from neutron.conf
+                # authUrl example: 'http://172.19.148.164:35357/v2.0/'
+                authUrl = ('%s://%s:%s/v2.0/' %
+                           (CONF.keystone_authtoken.auth_protocol,
+                            CONF.keystone_authtoken.auth_host,
+                            CONF.keystone_authtoken.auth_port))
+                neutronClient = client.Client(
+                    username=CONF.keystone_authtoken.admin_user,
+                    password=CONF.keystone_authtoken.admin_password,
+                    tenant_name=CONF.keystone_authtoken.admin_tenant_name,
+                    auth_url=authUrl)
+                try:
+                    # Check if the security group service VM name configured
+                    # in neutron.conf matches one of this port's security group
+                    # names.
+                    for secgrid in port['security_groups']:
+                        secgrp = neutronClient.show_security_group(secgrid)
+                        if secgrp['security_group']['name'] == \
+                           CONF.sec_group_svc_VM_name:
+                            sg_match = True
+                            break
+                except exceptions.NeutronException as e:
+                    LOG.error(_('Neutron Client show_security_group call'
+                              ' error: %s for sec group id %s') %
+                              (str(e), str(secgrid)))
+
+                # If port's sec gp isn't config in neutron.conf, add rule.
+                if (not sg_match):
+                    self.nwfilter.setup_basic_filtering( \
+                                            port['id'],
+                                            self._get_device_name(port),
+                                            self._get_mac_ip_pair(port))
+                    ipv4_iptables_rule += self._drop_dhcp_rule()
+
+            # For egress direction, anti spoofing is disabled. Add rule.
+            else:
+                self.nwfilter.setup_basic_filtering( \
+                                        port['id'],
+                                        self._get_device_name(port),
+                                        self._get_mac_ip_pair(port))
+                ipv4_iptables_rule += self._drop_dhcp_rule()
+        if direction == INGRESS_DIRECTION:
+            ipv6_iptables_rule += self._accept_inbound_icmpv6()
         ipv4_iptables_rule += self._convert_sgr_to_iptables_rules(
-            ipv4_sg_rules, port, "4", direction)
+            ipv4_sg_rules)
         ipv6_iptables_rule += self._convert_sgr_to_iptables_rules(
-            ipv6_sg_rules, port, "6", direction)
+            ipv6_sg_rules)
         self._add_rule_to_chain_v4v6(chain_name,
                                      ipv4_iptables_rule,
                                      ipv6_iptables_rule)
 
-    def _convert_sgr_to_iptables_rules(self, security_group_rules,
-                                       port, proto_version, direction):
+    def _convert_sgr_to_iptables_rules(self, security_group_rules):
         iptables_rules = []
         self._drop_invalid_packets(iptables_rules)
-        if proto_version == "4" and direction == INGRESS_DIRECTION:
-            self._drop_ingress_spoofing_rules(iptables_rules, port)
         self._allow_established(iptables_rules)
         for rule in security_group_rules:
             # These arguments MUST be in the format iptables-save will
@@ -313,10 +505,6 @@ class IptablesFirewallDriver(firewall.FirewallDriver):
         iptables_rules += ['-m state --state RELATED,ESTABLISHED -j RETURN']
         return iptables_rules
 
-    def _drop_ingress_spoofing_rules(self, iptables_rules, port):
-        chain_name = self._port_chain_name(port, SPOOF_FILTER)
-        iptables_rules += ['-j $%s' % chain_name]
-
     def _protocol_arg(self, protocol):
         if not protocol:
             return []
@@ -328,10 +516,19 @@ class IptablesFirewallDriver(firewall.FirewallDriver):
         return iptables_rule
 
     def _port_arg(self, direction, protocol, port_range_min, port_range_max):
-        if not (protocol in ['udp', 'tcp'] and port_range_min):
+        if (protocol not in ['udp', 'tcp', 'icmp', 'icmpv6']
+            or not port_range_min):
             return []
 
-        if port_range_min == port_range_max:
+        if protocol in ['icmp', 'icmpv6']:
+            # Note(xuhanp): port_range_min/port_range_max represent
+            # icmp type/code when protocal is icmp or icmpv6
+            # icmp code can be 0 so we cannot use "if port_range_max" here
+            if port_range_max is not None:
+                return ['--%s-type' % protocol,
+                        '%s/%s' % (port_range_min, port_range_max)]
+            return ['--%s-type' % protocol, '%s' % port_range_min]
+        elif port_range_min == port_range_max:
             return ['--%s' % direction, '%s' % (port_range_min,)]
         else:
             return ['-m', 'multiport',
@@ -352,6 +549,7 @@ class IptablesFirewallDriver(firewall.FirewallDriver):
     def filter_defer_apply_on(self):
         if not self._defer_apply:
             self.iptables.defer_apply_on()
+            self.nwfilter.defer_apply_on()
             self._pre_defer_filtered_ports = dict(self.filtered_ports)
             self._defer_apply = True
 
@@ -362,6 +560,7 @@ class IptablesFirewallDriver(firewall.FirewallDriver):
             self._pre_defer_filtered_ports = None
             self._setup_chains_apply(self.filtered_ports)
             self.iptables.defer_apply_off()
+            self.nwfilter.defer_apply_off()
 
 
 class OVSHybridIptablesFirewallDriver(IptablesFirewallDriver):
